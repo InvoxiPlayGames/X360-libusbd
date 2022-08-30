@@ -7,21 +7,30 @@
 #include <unistd.h>
 
 #include "libusbd.h"
+#include "x360_controller.h"
+
+#define X360_IF_CONTROL  0
+#define X360_IF_HEADSET  1
+#define X360_IF_UNKNOWN  2
+#define X360_IF_SECURITY 3
+
+// our libusbd context
+libusbd_ctx_t* pCtx;
+// control endpoints (interface 0)
+uint64_t control_ep_out;
+uint64_t control_ep_in;
+// audio/ext endpoints (interface 1)
+uint64_t microphone_ep_out;
+uint64_t headset_ep_in;
+uint64_t expansion_ep_out;
+uint64_t expansion_ep_in;
+// unknown endpoints (interface 2)
+uint64_t unknown_ep_out;
 
 volatile sig_atomic_t stop;
 
 void inthand(int signum) {
     stop = 1;
-}
-
-int control_class_impl(libusbd_setup_callback_info_t* info) {
-    printf("[CONTROL] bmRequestType:%02x bRequest:%02x wIndex:%04x wLength:%04x wValue:%04x\n", info->bmRequestType, info->bRequest, info->wIndex, info->wLength, info->wValue);
-    return 0;
-}
-
-int security_class_impl(libusbd_setup_callback_info_t* info) {
-    printf("[SECURITY] bmRequestType:%02x bRequest:%02x wIndex:%04x wLength:%04x wValue:%04x\n", info->bmRequestType, info->bRequest, info->wIndex, info->wLength, info->wValue);
-    return 0;
 }
 
 void hexdump(uint8_t *buf, int len) {
@@ -32,47 +41,98 @@ void hexdump(uint8_t *buf, int len) {
     printf("\n");
 }
 
-#define X360_IF_CONTROL  0
-#define X360_IF_HEADSET  1
-#define X360_IF_UNKNOWN  2
-#define X360_IF_SECURITY 3
+int control_class_impl(libusbd_setup_callback_info_t* info) {
+    printf("[CONTROL] bmRequestType:%02x bRequest:%02x wIndex:%04x wLength:%04x wValue:%04x\n", info->bmRequestType, info->bRequest, info->wIndex, info->wLength, info->wValue);
+    return 0;
+}
 
-typedef struct _xinput_report {
-    uint8_t message_type;
-    uint8_t message_size;
-} __attribute__((packed)) xinput_report;
+unsigned char xsm3_static_data_gamepad[] = {
+    0x49, 0x4B, 0x00, 0x00, 0x17, 0x04, 0xE1, 0x11,
+    0x54, 0x15, 0xED, 0x88, 0x55, 0x21, 0x01, 0x33,
+    0x00, 0x00, 0x80, 0x02, 0x5E, 0x04, 0x8E, 0x02,
+    0x03, 0x00, 0x01, 0x01, 0xC1
+};
+unsigned char xsm3_challenge_in_buffer[0x30] = { 0 };
+unsigned char xsm3_challenge_out_buffer[0x30] = { 0 };
 
-typedef struct _xinput_report_controls {
-    xinput_report header;
-    uint8_t buttons1;
-    uint8_t buttons2;
-    uint8_t left_trigger;
-    uint8_t right_trigger;
-    int16_t left_stick_x;
-    int16_t left_stick_y;
-    int16_t right_stick_x;
-    int16_t right_stick_y;
-    uint8_t padding[6];
-} __attribute__((packed)) xinput_report_controls;
+typedef enum _xsm3_state_enum {
+    XSM3_STATE_NOT_INITIALISED,
+    XSM3_STATE_DEVICE_INFO_SENT,
+    XSM3_STATE_CHALLENGE_1,
+    XSM3_STATE_CHALLENGE_2,
+    XSM3_STATE_COMPLETE
+} xsm3_state_enum;
+
+int xsm3_state = XSM3_STATE_NOT_INITIALISED;
+
+int security_class_impl(libusbd_setup_callback_info_t* info) {
+    // if the console is requesting state, we can populate the challenge input buffer
+    // for some reason iokit doesn't populate the out_data buffer with input data
+    // until *after* the callback completes, for some reason... luckily the console sends no new data in
+    // so we can just fetch it here... 
+    if (info->bRequest == 0x86) {
+        memcpy(xsm3_challenge_in_buffer, info->out_data, sizeof(xsm3_challenge_in_buffer));
+        hexdump(xsm3_challenge_in_buffer, sizeof(xsm3_challenge_in_buffer));
+        // TODO: calculate the challenge response
+    }
+
+    printf("[XSM3 - bmR:0x%02x bR:0x%02x wI:0x%04x wL:0x%04x wV:0x%04x] ", info->bmRequestType, info->bRequest, info->wIndex, info->wLength, info->wValue);
+
+    // switch what we're doing depending on the request
+    switch (info->bRequest) {
+        // console requesting information from the console
+        case 0x81:
+            printf("device info requested");
+            memcpy(info->out_data, xsm3_static_data_gamepad, info->wLength);
+            info->out_len = info->wLength;
+            xsm3_state = XSM3_STATE_DEVICE_INFO_SENT;
+            break;
+
+        // recieving challenge request data from the console
+        case 0x82:
+            printf("challenge 1 received");
+            info->out_len = info->wLength;
+            xsm3_state = XSM3_STATE_CHALLENGE_1;
+            break;
+        case 0x87:
+            printf("challenge 2 received");
+            info->out_len = info->wLength;
+            xsm3_state = XSM3_STATE_CHALLENGE_2;
+            break;
+        // console requesting challenge response data
+        case 0x83:
+            printf("challenge response requested");
+            memcpy(info->out_data, xsm3_challenge_out_buffer, info->wLength);
+            info->out_len = info->wLength;
+            break;
+
+        // console telling controller that authentication is finished
+        case 0x84:
+            printf("authentication completed!");
+            info->out_len = info->wLength;
+            xsm3_state = XSM3_STATE_COMPLETE;
+            break;
+        // console requesting the current state from authentication
+        case 0x86:
+            printf("state requested");
+            short state = 2; // completed. 1 = in-progress
+            memcpy(info->out_data, &state, sizeof(short));
+            info->out_len = sizeof(short);
+            break;
+
+        // what are you doing
+        default:
+            printf("!! XSM3 UNKNOWN PACKET !!");
+            break;
+    }
+    printf("\n");
+    return 0;
+}
 
 #define CONTROLLER_RATE_MS 4
 
 int main()
 {
-    // our libusbd context
-    libusbd_ctx_t* pCtx;
-    // control endpoints (interface 0)
-    uint64_t control_ep_out;
-    uint64_t control_ep_in;
-    // audio/ext endpoints (interface 1)
-    uint64_t microphone_ep_out;
-    uint64_t headset_ep_in;
-    uint64_t expansion_ep_out;
-    uint64_t expansion_ep_in;
-    // unknown endpoints (interface 2)
-    uint64_t unknown_ep_out;
-    // XSM3 has no endpoints.
-
     // register a handler for interrupts so we can safely close libusbd
     signal(SIGINT, inthand);
 
@@ -95,6 +155,7 @@ int main()
     libusbd_iface_alloc(pCtx, &iface_num);
     libusbd_iface_alloc(pCtx, &iface_num);
     libusbd_iface_alloc(pCtx, &iface_num);
+    // only now can we finalise the configuration
     libusbd_config_finalize(pCtx);
 
     // -- INTERFACE 0: CONTROL DATA --
@@ -102,8 +163,10 @@ int main()
     libusbd_iface_set_class(pCtx, X360_IF_CONTROL, 0xFF);
     libusbd_iface_set_subclass(pCtx, X360_IF_CONTROL, 0x5D);
     libusbd_iface_set_protocol(pCtx, X360_IF_CONTROL, 0x1);
-    // set the extra descriptor. idk what this does.
-    uint8_t control_report_desc[] = { 0x11, 0x21, 0x00, 0x01, 0x01, 0x25, 0x81, 0x14, 0x00, 0x00, 0x00, 0x00, 0x13, 0x01, 0x08, 0x00, 0x00 };
+    // set the extra descriptor. contains xinput data e.g. flags, type and subtype
+    char xinput_type = 0x01;
+    char xinput_subtype = 0x01;
+    uint8_t control_report_desc[] = { 0x11, 0x21, 0x00, xinput_type, xinput_subtype, 0x25, 0x81, 0x14, 0x00, 0x00, 0x00, 0x00, 0x13, 0x01, 0x08, 0x00, 0x00 };
     libusbd_iface_standard_desc(pCtx, X360_IF_CONTROL, 0x21, 0xF, control_report_desc, sizeof(control_report_desc));
     // add 2 endpoints, one for input, one for output
     libusbd_iface_add_endpoint(pCtx, X360_IF_CONTROL, USB_EPATTR_TTYPE_INTR, USB_EP_DIR_IN, 32, 4, 0, &control_ep_out);
@@ -145,13 +208,12 @@ int main()
     libusbd_iface_finalize(pCtx, X360_IF_UNKNOWN);
 
     // -- INTERFACE 3: SECURITY --
-    // TODO: this doesn't work! to get a console to talk, iInterface must go to a string descriptor (retail controller has it at 0x04) that says
-    // Xbox Security Method 3, Version 1.00, ©️ 2005 Microsoft Corporation. All rights reserved.
-    // after that, figure out how to answer. see oct0xor's research: http://oct0xor.github.io/2017/05/03/xsm3/
     // set up the classes
     libusbd_iface_set_class(pCtx, X360_IF_SECURITY, 0xFF);
     libusbd_iface_set_subclass(pCtx, X360_IF_SECURITY, 0xFD);
     libusbd_iface_set_protocol(pCtx, X360_IF_SECURITY, 0x13);
+    // set the interface description
+    libusbd_iface_set_description(pCtx, X360_IF_SECURITY, "Xbox Security Method 3, Version 1.00, \xA9 2099 Microsoft Corporation. All rights reserved.");
     // set the extra descriptor. idk what this does.
     uint8_t security_desc[] = { 0x06, 0x41, 0x00, 0x01, 0x01, 0x03 };
     libusbd_iface_standard_desc(pCtx, X360_IF_SECURITY, 0x41, 0xF, security_desc, sizeof(security_desc));
@@ -211,10 +273,10 @@ int main()
         controls.right_stick_x = -rotate_cycle;
         controls.right_stick_y = rotate_cycle;
         // set some random values
-        controls.left_trigger = rand() & 0xFF;
-        controls.right_trigger = rand() & 0xFF;
-        controls.buttons1 = rand() & 0xFF;
-        controls.buttons2 = rand() & 0xF3; // don't press guide. steam fucking sucks.
+        //controls.left_trigger = rand() & 0xFF;
+        //controls.right_trigger = rand() & 0xFF;
+        controls.buttons1 = rand() & 0x0F;
+        //controls.buttons2 = rand() & 0xF3; // don't press guide. steam fucking sucks.
         // boogie woogie
         rotate_cycle += 1000;
     }
